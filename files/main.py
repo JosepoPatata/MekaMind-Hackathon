@@ -68,18 +68,33 @@ def get_color_name_fast(r, g, b):
     distances = np.sum(np.abs(colors_matrix - [r, g, b]), axis=1)
     return color_names[np.argmin(distances)]
 
-def clasificar_color(nombre_color):
-    nombre = nombre_color.lower()
+def clasificar_color_hsv(roi_bgr):
+    """Calcula el color predominante con rangos HSV ajustados y filtro estricto de sombras."""
+    if roi_bgr is None or roi_bgr.size == 0:
+        return "desconocido"
+
+    # Convertir el parche de BGR a HSV
+    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
     
-    if any(k in nombre for k in ["red", "crimson", "scarlet", "rose", "rojo", "maroon"]):
+    # Obtener valores medianos
+    h_mean = np.median(hsv[:, :, 0])
+    s_mean = np.median(hsv[:, :, 1])
+    v_mean = np.median(hsv[:, :, 2])
+
+    # FILTRAR SOMBRAS Y FONDOS: Si hay poca saturación o el brillo es muy bajo (sombra oscura), descartar
+    if s_mean < 50 or v_mean < 60:
+        return "desconocido"
+
+    # RANGOS HSV AJUSTADOS EN OPENCV (Hue: 0-179)
+    if (0 <= h_mean <= 10) or (160 <= h_mean <= 179):
         return "rojo"
-    if any(k in nombre for k in ["blue", "cyan", "navy", "azure", "azul"]):
-        return "azul"
-    if any(k in nombre for k in ["green", "lime", "olive", "emerald", "verde"]):
-        return "verde"
-    if any(k in nombre for k in ["yellow", "gold", "amber", "amarillo"]):
+    elif 15 <= h_mean <= 35:
         return "amarillo"
-        
+    elif 35 < h_mean <= 85:
+        return "verde"
+    elif 90 <= h_mean <= 135:   # Rango de azul ampliado para que lo detecte sin fallo
+        return "azul"
+
     return "desconocido"
 
 # ==============================================================================
@@ -154,8 +169,11 @@ class BrazoReplaySubprocess:
 # ==============================================================================
 # 4. ESCANEO DINÁMICO DE LA MESA
 # ==============================================================================
+# ==============================================================================
+# 4. ESCANEO DINÁMICO DE LA MESA (Inmune a sombras y centrado en ROIs)
+# ==============================================================================
 def escanear_mesa(frame, rois_mesa):
-    """Analiza las 4 posiciones y devuelve un diccionario {posicion: color}, ignorando grises/fondos."""
+    """Analiza las posiciones filtrando sombras y detectando el color real del bloque."""
     mapa_posiciones_color = {}
 
     for pos_nombre, (x1, y1, x2, y2) in rois_mesa.items():
@@ -166,36 +184,49 @@ def escanear_mesa(frame, rois_mesa):
         if roi.size == 0:
             continue
 
-        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray_roi, 65, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        area_min = FRACCION_AREA_MIN * roi.shape[0] * roi.shape[1]
+        # Convertir todo el parche del ROI a espacio HSV
+        hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        
+        # MASCARA DE FILTRADO: Ignora automáticamente fondos grises/blancos y sombras oscuras
+        # Exigimos una saturación y brillo mínimos para asegurar que es un bloque de color
+        mask = (hsv_roi[:, :, 1] > 45) & (hsv_roi[:, :, 2] > 55)
+        
+        if not np.any(mask):
+            continue  # Si no hay suficientes píxeles de color, pasa de largo
 
-        for cnt in contours:
-            if cv2.contourArea(cnt) <= area_min:
-                continue
-            M = cv2.moments(cnt)
-            if M["m00"] == 0:
-                continue
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
+        # Extraer únicamente los valores HSV de los píxeles válidos del bloque
+        h_valid = hsv_roi[:, :, 0][mask]
+        s_valid = hsv_roi[:, :, 1][mask]
+        v_valid = hsv_roi[:, :, 2][mask]
 
-            parche = roi[max(0, cy - 5):cy + 5, max(0, cx - 5):cx + 5]
-            if parche.size == 0:
-                continue
-            b, g, r = (int(v) for v in parche.reshape(-1, 3).mean(axis=0))
+        # Calcular la mediana de los píxeles limpios del cubo
+        h_mean = np.median(h_valid)
+        s_mean = np.median(s_valid)
+        v_mean = np.median(v_valid)
 
-            categoria = clasificar_color(get_color_name_fast(r, g, b))
+        # Doble comprobación de seguridad contra sombras difusas
+        if s_mean < 45 or v_mean < 55:
+            continue
 
-            # SI ES DESCONOCIDO (GRISES, FONDO DE MESA, ETC.), LO IGNORAMOS
-            if categoria == "desconocido":
-                continue
+        # CLASIFICACIÓN POR RANGOS DE MATIZ (HUE) AMPLIADOS
+        categoria = "desconocido"
+        if (0 <= h_mean <= 10) or (160 <= h_mean <= 179):
+            categoria = "rojo"
+        elif 10 <= h_mean <= 42:    # Rango del amarillo ampliado para evitar falsos negativos
+            categoria = "amarillo"
+        elif 42 < h_mean <= 85:     # Rango del verde
+            categoria = "verde"
+        elif 90 <= h_mean <= 135:   # Rango del azul
+            categoria = "azul"
 
-            mapa_posiciones_color[pos_nombre] = categoria
+        if categoria == "desconocido":
+            continue
 
-            # Dibujar el rectángulo y el nombre solo si es un color válido
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, categoria.upper(), (x1, y2 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        mapa_posiciones_color[pos_nombre] = categoria
+
+        # Dibujar el rectángulo verde y la etiqueta del color detectado
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(frame, categoria.upper(), (x1, y2 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
     return mapa_posiciones_color
 
@@ -242,10 +273,10 @@ def main():
             # Si pulsas la barra espaciadora, el script te pregunta el comando por consola
             if key == 32:
                 print("\n--- NUEVA ORDEN DE MOVIMIENTO ---")
-                color_origen = input("¿Qué color de bloque quieres mover? (ej: rojo, azul, verde, amarillo): ").strip().lower()
-                color_destino = input("¿Sobre qué color de bloque quieres colocarlo?: ").strip().lower()
+                color_origen = input("¿Qué color quieres mover (primero)?: ").strip().lower()
+                color_destino = input("¿A qué color quieres que vaya (segundo)?: ").strip().lower()
 
-                # Buscar en qué posición está cada color según el último escaneo de la mesa
+                # Buscar en qué posición física está cada color según el escaneo actual de la cámara
                 pos_origen = None
                 pos_destino = None
 
@@ -255,19 +286,19 @@ def main():
                     elif col == color_destino:
                         pos_destino = pos
 
-                print(f"Buscando '{color_origen}' -> Encontrado en: {pos_origen}")
-                print(f"Buscando '{color_destino}' -> Encontrado en: {pos_destino}")
+                print(f"[>] Buscando bloque '{color_origen}' -> Posición origen: {pos_origen}")
+                print(f"[>] Buscando bloque destino '{color_destino}' -> Posición destino: {pos_destino}")
 
                 if pos_origen and pos_destino:
                     if pos_origen == pos_destino:
                         print("[!] Error: El bloque origen y destino están en la misma posición.")
                     else:
+                        # Busca el par (origen, destino) en EPISODIOS y ejecuta el replay del dataset
                         brazo.reproducir((pos_origen, pos_destino))
                         for _ in range(5):
                             cap.grab()
                 else:
-                    print("[!] No se han podido localizar ambos colores en la mesa. Comprueba que los bloques estén bien colocados.")
-
+                    print("[!] No se han podido localizar ambos colores en la mesa en este momento. Revisa que los cubos estén bien colocados.")
     finally:
         cap.release()
         cv2.destroyAllWindows()
