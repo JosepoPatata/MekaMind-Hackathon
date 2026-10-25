@@ -1,4 +1,5 @@
 {
+  "authors": "MekaMind group",
   "entrypoint": "main.py",
   "items": [
     {
